@@ -2,12 +2,12 @@ name: LLMOps Build, Scan, and Deploy
 
 on:
   push:
-    branches: [ "main" ] # Trigger on pushes to the main branch
+    branches: ["main"] # Trigger on pushes to the main branch
   workflow_dispatch: # Allow manual trigger from the GitHub UI
 
 # Define environment variables based on your Kubernetes and Docker files
 env:
-  # The image name used in your deployment.yaml is 'darryl1975/fastapi-app'. 
+  # The image name used in your deployment.yaml is 'darryl1975/fastapi-app'.
   # Set the full repository path, replacing 'darryl1975' with your DOCKERHUB_USERNAME secret.
   IMAGE_REPO: ${{ secrets.DOCKERHUB_USERNAME }}/fastapi-app
   IMAGE_TAG: ${{ github.sha }} # Use the commit SHA for a unique, immutable tag
@@ -18,32 +18,33 @@ env:
 jobs:
   build-scan-deploy:
     runs-on: ubuntu-latest
-    
+
     permissions:
       contents: read # Required to checkout the code
       packages: write # Required for security features (SARIF report upload)
-      
+
     steps:
       - name: ⬇️ Checkout Repository Code
         uses: actions/checkout@v4
 
       # --- 1. BUILD IMAGE & PUSH (Login Prep) ---
-      
+
       - name: 🛠 Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-        
+
       - name: 🔑 Log in to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: 🧱 Build Docker Image (Tag Locally)
-        # Build and tag the image using the unique commit SHA
-        run: |
-          docker build . \
-            --tag ${{ env.IMAGE_REPO }}:${{ env.IMAGE_TAG }} \
-            --file Dockerfile
+      - name: 🧱 Build and Push Docker image
+        # Build and push the image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true # We will push later after scanning
+          tags: ${{ env.IMAGE_REPO }}:${{ env.IMAGE_TAG }}
 
       # --- 2. SCAN IMAGE using Trivy ---
 
@@ -51,41 +52,47 @@ jobs:
         uses: aquasecurity/trivy-action@0.21.0
         with:
           image-ref: ${{ env.IMAGE_REPO }}:${{ env.IMAGE_TAG }}
-          format: 'table'
+          format: "table"
           # Fail the build if any HIGH or CRITICAL severity vulnerabilities are found
-          severity: 'HIGH,CRITICAL'
-          exit-code: '1' 
-          output: 'trivy-results.sarif' # Output SARIF for GitHub Security Tab
-          
+          severity: "HIGH,CRITICAL"
+          exit-code: "1"
+          output: "trivy-results.sarif" # Output SARIF for GitHub Security Tab
+          token: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: ⬆️ Upload Trivy Scan Report
         if: always() # Run even if Trivy fails, so you can see the security report
         uses: github/codeql-action/upload-sarif@v3
         with:
-          sarif_file: 'trivy-results.sarif'
+          sarif_file: "trivy-results.sarif"
 
-      # --- 1. PUSH IMAGE (Completion) ---
+      # --- 3. DEPLOY to Kubernetes Digital Ocean---
 
-      - name: 📤 Push Image to Docker Hub
-        # This step only executes if the Trivy scan (exit-code 1) passed (exit-code 0)
-        run: docker push ${{ env.IMAGE_REPO }}:${{ env.IMAGE_TAG }}
-
-      # --- 3. DEPLOY to Kubernetes ---
-
-      - name: ☁️ Set Kubernetes Context
-        uses: azure/k8s-set-context@v4
+      - name: ⚙️ Install and Authenticate doctl
+        # Uses the DigitalOcean PAT to enable the 'doctl' CLI tool
+        uses: digitalocean/action-doctl@v2
         with:
-          # Uses the KUBE_CONFIG_DATA secret for authentication
-          kubeconfig: ${{ secrets.KUBE_CONFIG_DATA }}
-          
-      - name: 🚀 Update Kubernetes Deployment
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+      - name: ☁️ Save DOKS Kubeconfig
+        # Runs only if the Trivy scan passed
+        if: success()
         run: |
-          # Patch the existing Deployment to use the newly pushed, secure image tag
+          doctl kubernetes cluster kubeconfig save ${{ secrets.DOKS_CLUSTER_NAME }}
+
+      - name: 🚀 Update Kubernetes Deployment
+        # Runs only if the Trivy scan passed
+        if: success()
+        run: |
+          # Patch the Deployment with the new image tag
           kubectl set image deployment/${{ env.K8S_DEPLOYMENT }} \
             ${{ env.K8S_CONTAINER_NAME }}=${{ env.IMAGE_REPO }}:${{ env.IMAGE_TAG }} \
             --namespace ${{ env.K8S_NAMESPACE }}
-          
-          # Force a rollout to ensure the change is applied immediately
+
+          # Force a rollout restart and wait for completion
           kubectl rollout restart deployment/${{ env.K8S_DEPLOYMENT }} \
             --namespace ${{ env.K8S_NAMESPACE }}
-          
-          echo "Deployment ${{ env.K8S_DEPLOYMENT }} updated with image tag ${{ env.IMAGE_TAG }}"
+            
+          kubectl rollout status deployment/${{ env.K8S_DEPLOYMENT }} \
+            --namespace ${{ env.K8S_NAMESPACE }}
+
+          echo "Deployment successful on DOKS."
