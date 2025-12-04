@@ -1,0 +1,90 @@
+name: LLMOps CI/CD Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+
+# Define environment variables for the workflow
+env:
+  DOCKER_IMAGE_NAME: your-dockerhub-username/llm-app
+  DOCKER_TAG: ${{ github.sha }} # Use the commit SHA for a unique, immutable tag
+  K8S_DEPLOYMENT_NAME: llm-deployment
+  K8S_NAMESPACE: default
+  
+jobs:
+  build-scan-deploy:
+    runs-on: ubuntu-latest
+    
+    # Permissions are needed for checkout, and to interact with GitHub's token for secure actions
+    permissions:
+      contents: read
+      packages: write
+      
+    steps:
+      - name: ⬇️ Checkout Repository Code
+        uses: actions/checkout@v4
+
+      # --- 1. Push your image to Docker Hub (Preparation: Login and Build) ---
+      
+      - name: 🛠 Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        
+      - name: 🔑 Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: 🧱 Build Docker Image (Do NOT push yet)
+        # Build the image and tag it locally for the Trivy scan
+        run: |
+          docker build . \
+            --tag ${{ env.DOCKER_IMAGE_NAME }}:${{ env.DOCKER_TAG }} \
+            --file Dockerfile
+
+      # --- 2. Scan image using Trivy ---
+
+      - name: 🔒 Scan Image with Trivy
+        uses: aquasecurity/trivy-action@0.21.0
+        with:
+          # Scan the locally built image
+          image-ref: ${{ env.DOCKER_IMAGE_NAME }}:${{ env.DOCKER_TAG }}
+          format: 'table'
+          # Set the minimum severity to report. Adjust as needed (e.g., HIGH,CRITICAL)
+          severity: 'HIGH,CRITICAL'
+          # Fail the build if any specified severity vulnerabilities are found
+          exit-code: '1' 
+          # Optional: Upload a SARIF report to GitHub Security tab
+          output: 'trivy-results.sarif'
+          
+      - name: ⬆️ Upload Trivy Scan Report
+        if: always() # Run even if the previous step failed, so you can see the results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      # --- 1. Push your image to Docker Hub (Completion: Push) ---
+
+      - name: 📤 Push Image to Docker Hub
+        # This step only runs if the Trivy scan (step 5) passed successfully (exit-code 0)
+        run: docker push ${{ env.DOCKER_IMAGE_NAME }}:${{ env.DOCKER_TAG }}
+
+      # --- 3. Push to Deploy to Kubernetes ---
+
+      - name: ☁️ Deploy to Kubernetes
+        uses: azure/k8s-set-context@v4
+        with:
+          # Use a secret containing your Kubernetes configuration file content
+          kubeconfig: ${{ secrets.KUBE_CONFIG_DATA }}
+          
+      - name: 🚀 Apply Kubernetes Manifest
+        # This assumes you have a deployment file (e.g., k8s/deployment.yaml) that 
+        # uses the image name defined in the environment variables.
+        run: |
+          # The deployment file must be updated to use the new image tag before applying.
+          # Here, we demonstrate patching the deployment to use the new image tag.
+          kubectl set image deployment/${{ env.K8S_DEPLOYMENT_NAME }} \
+            app-container=${{ env.DOCKER_IMAGE_NAME }}:${{ env.DOCKER_TAG }} \
+            --namespace ${{ env.K8S_NAMESPACE }}
+          
+          echo "Successfully triggered deployment rollout in Kubernetes."
