@@ -9,7 +9,7 @@ on:
 env:
   IMAGE_NAME: llmops-fastapi
   IMAGE_TAG: latest
-  IMAGE_REPO: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+  IMAGE_REPO: ghcr.io/${{ github.repository_owner }}/llmops-fastapi
 
   DEPLOYMENT_FILE: deployment.yaml
   SERVICE_FILE: service.yaml
@@ -51,7 +51,7 @@ jobs:
           docker run --rm \
           -v /var/run/docker.sock:/var/run/docker.sock \
           -v $HOME/.cache/trivy:/root/.cache \
-          aquasecurity/trivy:latest image --severity HIGH, CRITICAL \
+          aquasecurity/trivy:latest image --severity HIGH,CRITICAL \
           ${{ env.IMAGE_REPO }}:${{ env.IMAGE_TAG }}
 
   deploy-kubernetes:
@@ -59,9 +59,10 @@ jobs:
     needs: trivy-scan
 
     steps:
+      - name: Checkout Code
       - uses: actions/checkout@v4
 
-      - name: Setup Kubernetes & cluster
+      - name: Setup Kubernetes Cluster
         run: |
           curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash 
           k3d cluster create llmops --api-port 6550 -p "30007:30007@server:0" || echo "Cluster exists"
@@ -70,10 +71,10 @@ jobs:
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
       
-      - name: Pull and Import image
+      - name: Pull and Import image to Kubernetes
         run: |
           docker pull ${{ env.IMAGE_REPO }}:${{ env.IMAGE_TAG }}
-          k3d image import ${{ env.IMAGE_REPO }}:${{ env.IMAGE_TAG }} -c llmops
+          k3d image import ${{ env.IMAGE_REPO }}:${{ env.IMAGE_TAG }} --cluster llmops
 
       - name: Deploy Kubernetes
         run: |
@@ -88,4 +89,4 @@ jobs:
           kubectl rollout status deployment/${{ env.DEPLOYMENT_NAME }} --timeout=180s
 
       - name: Post Deploy Success
-        run: echo "App available at http://localhost:30007 (internally)."
+        run: echo "Deploy successfully!"
